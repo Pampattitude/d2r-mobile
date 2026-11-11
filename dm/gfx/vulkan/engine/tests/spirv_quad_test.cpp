@@ -254,6 +254,20 @@ static void run_tests(const fs::path &output={}) {
         if(!output.empty())save(output/(std::string(test.name)+"-unchanged.spv"),original);
         ++cases;
     }
+    // The separately named experiment rewrites the helper shuffle even when uniformity or numeric bit-flow cannot be
+    // established; production gates it to subgroup helpers on a marked Adreno 650.
+    for(auto mode:{Call::divergent,Call::integer_source,Call::integer_use}) {
+        auto original=call_fixture(1,0x1c03,mode);Words rewritten;xbg_spirv_quad_stats stats;
+        assert(xbg_spirv_quad_derivatives_experimental(original.data(),original.size(),rewritten,&stats)==1);
+        assert(stats.calls==1 && stats.calls_rewritten==1 && stats.call_skipped[size_t(xbg_quad_call_skip::control_flow)]==0);
+        for(size_t at=5;at<rewritten.size();) {
+            unsigned wc=rewritten[at]>>16,op=rewritten[at]&65535;
+            assert(wc && at+wc<=rewritten.size());
+            assert(op!=57 || rewritten[at+3]!=200);
+            at+=wc;
+        }
+        ++cases;
+    }
     auto existing=fixture(3,Mode::existing_coord);Words out;xbg_spirv_quad_stats stats;
     assert(xbg_spirv_quad_derivatives(existing.data(),existing.size(),out,&stats)==1);++cases;
     auto invalid=fixture(3);invalid[5]=0;assert(!xbg_spirv_quad_derivatives(invalid.data(),invalid.size(),out,&stats));assert(out.empty());++cases;
@@ -285,12 +299,48 @@ static void audit(const fs::path &directory,const fs::path &output={}) {
     }
     std::cerr<<"AUDIT modules="<<modules<<" rewritten="<<total<<"\n";
 }
+static bool has_group_operations(const Words &words) {
+    for(size_t at=5;at<words.size();) {
+        uint32_t count=words[at]>>16,op=words[at]&65535;
+        if(!count || count>words.size()-at)return false;
+        if(op>=333 && op<=366)return true;
+        at+=count;
+    }
+    return false;
+}
+static void audit_experimental(const fs::path &directory,const fs::path &output) {
+    if(!output.empty())fs::create_directories(output);
+    size_t audited=0;
+    std::vector<fs::path> files;
+    for(const auto &entry:fs::directory_iterator(directory))if(entry.path().extension()==".xgs")files.push_back(entry.path());
+    std::sort(files.begin(),files.end());
+    for(const auto &path:files) {
+        std::ifstream file(path,std::ios::binary);if(!file)throw std::runtime_error("cannot open shader "+path.string());
+        std::vector<char> raw((std::istreambuf_iterator<char>(file)),{});
+        if(raw.size()<32)throw std::runtime_error("short XGS "+path.string());
+        uint32_t h[8];std::memcpy(h,raw.data(),32);size_t offset=32+size_t(h[3])*32+size_t(h[4])*4+h[5];
+        if(h[0]!=0x31534758 || h[1]!=1 || h[6]%4 || offset>raw.size() || h[6]!=raw.size()-offset)
+            throw std::runtime_error("invalid XGS extent "+path.string());
+        if(h[2]!=4)continue;
+        Words before(h[6]/4),after;std::memcpy(before.data(),raw.data()+offset,h[6]);
+        if(!has_group_operations(before))continue;
+        xbg_spirv_quad_stats stats;
+        size_t rewritten=xbg_spirv_quad_derivatives_experimental(before.data(),before.size(),after,&stats);
+        if(!rewritten || stats.calls!=stats.calls_rewritten)
+            throw std::runtime_error("experimental shader was not fully rewritten "+path.stem().string());
+        if(!output.empty())save(output/(path.stem().string()+".spv"),after);
+        ++audited;
+    }
+    if(!audited)throw std::runtime_error("no fragment subgroup shaders found");
+    std::cout<<"EXPERIMENTAL_AUDIT shaders="<<audited<<"\n";
+}
 int main(int argc,char **argv) {
     try {
         if(argc>=3 && std::string(argv[1])=="--audit")audit(argv[2],argc>=4?fs::path(argv[3]):fs::path{});
+        else if(argc==4 && std::string(argv[1])=="--audit-experimental")audit_experimental(argv[2],argv[3]);
         else if(argc==3 && std::string(argv[1])=="--emit-fixtures")run_tests(argv[2]);
         else if(argc==1)run_tests();
-        else {std::cerr<<"usage: quad_test [--emit-fixtures dir | --audit xgs-dir [spv-dir]]\n";return 2;}
+        else {std::cerr<<"usage: quad_test [--emit-fixtures dir | --audit xgs-dir [spv-dir] | --audit-experimental xgs-dir spv-dir]\n";return 2;}
         return 0;
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }

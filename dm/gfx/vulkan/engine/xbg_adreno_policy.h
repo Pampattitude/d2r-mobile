@@ -58,3 +58,7 @@ inline bool xbg_adreno_compiler_needs_inline(uint32_t vendor_id,const char *devi
     const int model=xbg_adreno_model(device_name);
     return model>=750 && model<800;
 }
+
+inline bool xbg_adreno650_fragment_subgroups_experimental(uint32_t vendor_id,const char *device_name,bool marker_present,int marker){
+    return marker_present && marker!='0' && vendor_id==0x5143 && xbg_adreno_model(device_name)==650;
+}

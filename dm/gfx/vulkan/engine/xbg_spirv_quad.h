@@ -28,3 +28,7 @@ const char *xbg_spirv_quad_call_skip_name(xbg_quad_call_skip reason);
 size_t xbg_spirv_quad_derivatives(const uint32_t *words,size_t count,std::vector<uint32_t> &out,
                                   xbg_spirv_quad_stats *stats);
 size_t xbg_spirv_quad_derivatives(const uint32_t *words,size_t count,std::vector<uint32_t> &out);
+// Explicit opt-in for the Adreno 650 experiment: rewrite proven SHFL helpers even when control-flow or bit-flow analysis
+// cannot establish safety. The caller must narrowly gate this to the tested shader set and device.
+size_t xbg_spirv_quad_derivatives_experimental(const uint32_t *words,size_t count,std::vector<uint32_t> &out,
+                                               xbg_spirv_quad_stats *stats);

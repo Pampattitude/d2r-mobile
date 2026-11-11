@@ -565,7 +565,7 @@ struct BitFlow {
     }
 };
 struct CallPlan {size_t index;uint32_t value_var,mask;};
-std::vector<CallPlan> plan_calls(const Module &m,bool contract,xbg_spirv_quad_stats &s) {
+std::vector<CallPlan> plan_calls(const Module &m,bool contract,xbg_spirv_quad_stats &s,bool experimental) {
     std::vector<CallPlan> plans;std::vector<uint32_t> helper_fns;
     for(const auto &i:m.instructions)if(i.op==Shuffle && i.fn && i.fn!=m.entry_fn && std::find(helper_fns.begin(),helper_fns.end(),i.fn)==helper_fns.end())helper_fns.push_back(i.fn);
     if(helper_fns.empty())return plans;
@@ -606,13 +606,15 @@ std::vector<CallPlan> plan_calls(const Module &m,bool contract,xbg_spirv_quad_st
     Uniformity uniform(m,cfg,vars);BitFlow flow{m,vars,call_value};
     for(const auto &c:candidates) {
         const auto &i=m.instructions[c.index];const auto *p=m.w+i.offset;int b=cfg.block_of[c.index];
-        if(b<0 || !uniform.block_ok[size_t(b)]) {skip(xbg_quad_call_skip::control_flow);continue;}
+        if(b<0 || (!experimental && !uniform.block_ok[size_t(b)])) {skip(xbg_quad_call_skip::control_flow);continue;}
         uint32_t var=p[4+c.value];const auto *v=m.def(var);
         if(!scalar32(m,i.type) || !v || !scalar32(m,m.types[v->type].b)) {skip(xbg_quad_call_skip::source);continue;}
-        bool numeric=!vars[var].stores.empty();
-        for(size_t k:vars[var].stores)if(!flow.source(m.w[m.instructions[k].offset+2])) {numeric=false;break;}
-        if(!numeric) {skip(xbg_quad_call_skip::source);continue;}
-        if(!flow.uses(i.id)) {skip(xbg_quad_call_skip::use);continue;}
+        if(!experimental) {
+            bool numeric=!vars[var].stores.empty();
+            for(size_t k:vars[var].stores)if(!flow.source(m.w[m.instructions[k].offset+2])) {numeric=false;break;}
+            if(!numeric) {skip(xbg_quad_call_skip::source);continue;}
+            if(!flow.uses(i.id)) {skip(xbg_quad_call_skip::use);continue;}
+        }
         plans.push_back({c.index,var,c.x});
     }
     return plans;
@@ -628,7 +630,7 @@ const char *xbg_spirv_quad_call_skip_name(xbg_quad_call_skip reason) {
     auto index=static_cast<size_t>(reason);return index<static_cast<size_t>(xbg_quad_call_skip::count)?names[index]:"invalid_reason";
 }
 
-size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32_t> &out,xbg_spirv_quad_stats *stats) {
+static size_t quad_derivatives_impl(const uint32_t *in,size_t n,std::vector<uint32_t> &out,xbg_spirv_quad_stats *stats,bool experimental) {
     out.clear();xbg_spirv_quad_stats local;auto &s=stats?*stats:local;s={};
     auto skip=[&](xbg_quad_skip reason){++s.skipped[static_cast<size_t>(reason)];};
     if(!in || n<5 || in[0]!=0x07230203 || !in[3] || in[3]>(1u<<22) || n>(1u<<24)) {skip(xbg_quad_skip::malformed);return 0;}
@@ -666,7 +668,7 @@ size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32
         if(!index_ok || mask<1 || mask>3) {skip(xbg_quad_skip::lane_index);continue;}
         plans.push_back({index,mask});
     }
-    auto calls=plan_calls(m,contract,s);
+    auto calls=plan_calls(m,contract,s,experimental);
     if(plans.empty() && calls.empty())return 0;
     uint32_t bound=m.bound;auto fresh=[&](){return bound++;};
     std::vector<uint32_t> declarations,decorations;
@@ -741,6 +743,12 @@ size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32
     }
     out[3]=bound;return s.rewritten+s.calls_rewritten;
 }
+size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32_t> &out,xbg_spirv_quad_stats *stats) {
+    return quad_derivatives_impl(in,n,out,stats,false);
+}
 size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32_t> &out) {
     return xbg_spirv_quad_derivatives(in,n,out,nullptr);
+}
+size_t xbg_spirv_quad_derivatives_experimental(const uint32_t *in,size_t n,std::vector<uint32_t> &out,xbg_spirv_quad_stats *stats) {
+    return quad_derivatives_impl(in,n,out,stats,true);
 }
