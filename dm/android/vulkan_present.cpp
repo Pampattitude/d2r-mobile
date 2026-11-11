@@ -76,11 +76,11 @@ bool present_timing=false;VkQueryPool present_queries=VK_NULL_HANDLE;bool presen
 // (in-process A/B, CPU 17.1 -> 14.3 ms). MIUI rewrites thread affinity masks, so the pin is checked every 120 presents.
 // Marker gfx-no-pin turns it off and gfx-pin-cpu = hex mask picks the cores; gfx-ab-toggle = N with gfx-ab-target = pin
 // alternates pinned and released every N seconds, in phase with the engine's A/B (its PERF lines carry ab=).
-unsigned pin_mask=0;int pin_ab=0;int pin_state=-1;unsigned pin_presents=0,pin_drifts=0,pin_failures=0;cpu_set_t pin_original;bool pin_have_original=false;
-unsigned fastest_cores(){
+unsigned pin_mask=0;int pin_ab=0;int pin_state=-1;unsigned pin_presents=0,pin_drifts=0,pin_failures=0;cpu_set_t pin_original;bool pin_have_original=false,pin_manual=false;
+unsigned fastest_cores(unsigned excluded=0){
     unsigned best=0,mask=0,present=0;
     for(int c=0;c<32;c++){char path[96];snprintf(path,sizeof path,"/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",c);FILE *f=fopen(path,"rb");if(!f)continue;
-        unsigned v=0;if(fscanf(f,"%u",&v)==1 && v){present|=1u<<c;if(v>best){best=v;mask=0;}if(v==best)mask|=1u<<c;}fclose(f);}
+        unsigned v=0;if(fscanf(f,"%u",&v)==1 && v){present|=1u<<c;if(excluded>>c&1){fclose(f);continue;}if(v>best){best=v;mask=0;}if(v==best)mask|=1u<<c;}fclose(f);}
     return mask==present?0:mask;   // one core class: nothing to pick
 }
 void pin_update(){
@@ -88,12 +88,18 @@ void pin_update(){
     if(pin_ab>0){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);want=((ts.tv_sec/pin_ab)&1)==0;}
     bool changed=int(want)!=pin_state;if(!changed && ++pin_presents%120)return;
     if(!pin_have_original){CPU_ZERO(&pin_original);if(sched_getaffinity(0,sizeof pin_original,&pin_original))for(int c=0;c<32;c++)CPU_SET(c,&pin_original);pin_have_original=true;}
+    unsigned requested=pin_mask;
     cpu_set_t set;CPU_ZERO(&set);if(want){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_SET(c,&set);}else set=pin_original;
     if(!changed){cpu_set_t cur;CPU_ZERO(&cur);if(!sched_getaffinity(0,sizeof cur,&cur) && CPU_EQUAL(&cur,&set))return;++pin_drifts;}
-    int r=sched_setaffinity(0,sizeof set,&set),err=r?errno:0;pin_state=want;if(r)++pin_failures;
-    // Refused while the app's cpuset lacks the cores (Android moves the app between cpusets, at start for one): the kernel
-    // keeps the request and applies it again when the cpuset allows, and the next check retries.
-    if(changed || pin_drifts<=4 || (r && pin_failures<=4))vlog("NVN pin tid=%d %s mask=%x result=%d errno=%d drifts=%u failures=%u",int(gettid()),want?"pinned":"released",want?pin_mask:0u,r,err,pin_drifts,pin_failures);
+    int r=sched_setaffinity(0,sizeof set,&set),err=r?errno:0;unsigned fallback=0;
+    if(r && err==EINVAL && want && !pin_manual){
+        fallback=fastest_cores(pin_mask);
+        if(fallback){CPU_ZERO(&set);for(int c=0;c<32;c++)if(fallback>>c&1)CPU_SET(c,&set);r=sched_setaffinity(0,sizeof set,&set);err=r?errno:0;if(!r)pin_mask=fallback;}
+    }
+    pin_state=want;if(r)++pin_failures;
+    // Android may move the app between cpusets. On EINVAL, a default pin falls back once to the next fastest core class.
+    // 标记 gfx-pin-cpu 保持严格指定；默认核遇到 EINVAL 时回退到下一档最高频核。
+    if(changed || pin_drifts<=4 || (r && pin_failures<=4))vlog("NVN pin tid=%d %s mask=%x requested=%x result=%d errno=%d drifts=%u failures=%u fallback=%x",int(gettid()),want?"pinned":"released",want?pin_mask:0u,requested,r,err,pin_drifts,pin_failures,fallback);
 }
 void log_message(void*,const char *text){vlog("%s",text);}
 [[noreturn]] void fatal(void*,const char *text){vlog("%s",text);__android_log_print(ANDROID_LOG_FATAL,"dm","%s",text);abort();}
@@ -366,8 +372,8 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};if((r=vkCreateSemaphore(device,&sc,nullptr,&acquired)))return fail("Acquire semaphore",r);VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};if((r=vkCreateFence(device,&fc,nullptr,&fence)))return fail("Present fence",r);
     {std::string dir=path;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-overlap").c_str(),"rb");overlap=true;if(m){overlap=fgetc(m)!='0';fclose(m);}
      auto open_marker=[&](const char *name){return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");};
-     pin_mask=fastest_cores();pin_ab=0;pin_state=-1;pin_have_original=false;pin_presents=pin_drifts=0;
-     if(FILE *p=open_marker("/gfx-pin-cpu")){if(fscanf(p,"%x",&pin_mask)!=1)pin_mask=0;fclose(p);}
+     pin_mask=fastest_cores();pin_ab=0;pin_manual=false;pin_state=-1;pin_have_original=false;pin_presents=pin_drifts=0;
+     if(FILE *p=open_marker("/gfx-pin-cpu")){if(fscanf(p,"%x",&pin_mask)==1)pin_manual=true;else pin_mask=0;fclose(p);}
      if(FILE *n=open_marker("/gfx-no-pin")){pin_mask=0;fclose(n);}
      if(FILE *t=open_marker("/gfx-ab-target")){char target[16]={0};if(fscanf(t,"%15s",target)==1 && !strcmp(target,"pin"))if(FILE *a=open_marker("/gfx-ab-toggle")){if(fscanf(a,"%d",&pin_ab)!=1)pin_ab=0;fclose(a);}fclose(t);}
      vlog("NVN pin mask=%x ab=%d (markers gfx-no-pin, gfx-pin-cpu, gfx-ab-target=pin)",pin_mask,pin_ab);
