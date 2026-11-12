@@ -2013,13 +2013,14 @@ void pipe_memo_fill(PipeMemoKey &k,const void *layout,const void *pass_def,VkRen
     k.rt_n=uint32_t(state.rt.n);k.colors=colors;k.depth=state.rt.depth!=nullptr;k.depth_format=state.rt.depth?uint32_t(state.rt.depth->d.format):0;
     const uint8_t *b=reinterpret_cast<const uint8_t*>(&state);memcpy(k.fixed,b+offsetof(State,attrib),sizeof k.fixed);memcpy(k.stencil,b+offsetof(State,blend_color),sizeof k.stencil);memcpy(k.tail,b+offsetof(State,patch_size),sizeof k.tail);
 }
-void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
+void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage,const char *key,bool experimental=false){
     need(w.size()>=5 && w[0]==0x07230203,"Invalid packaged SPIR-V");bool group_operations=false;VkSubgroupFeatureFlags groups=0;
     for(size_t i=5;i<w.size();){uint32_t count=w[i]>>16,op=w[i]&65535;need(count && i+count<=w.size(),"Invalid SPIR-V instruction bounds");if(op>=333 && op<=366)group_operations=true;
-        if(op==17){uint32_t cap=w[i+1];bool ok=true;switch(cap){case 1:case 46:case 47:case 50:break;case 2:ok=cfg.enabled_core.geometryShader;break;case 3:ok=cfg.enabled_core.tessellationShader;break;case 10:ok=cfg.enabled_core.shaderFloat64;break;case 11:ok=cfg.enabled_core.shaderInt64;break;case 22:ok=cfg.enabled_core.shaderInt16;break;case 25:ok=cfg.enabled_core.shaderImageGatherExtended;break;case 32:ok=cfg.enabled_core.shaderClipDistance;break;case 33:ok=cfg.enabled_core.shaderCullDistance;break;case 35:ok=cfg.enabled_core.sampleRateShading;break;case 49:ok=cfg.enabled_core.shaderStorageImageExtendedFormats;break;case 55:ok=cfg.enabled_core.shaderStorageImageReadWithoutFormat;break;case 56:ok=cfg.enabled_core.shaderStorageImageWriteWithoutFormat;break;case 61:groups|=VK_SUBGROUP_FEATURE_BASIC_BIT;break;case 62:groups|=VK_SUBGROUP_FEATURE_VOTE_BIT;break;case 63:groups|=VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;break;case 64:groups|=VK_SUBGROUP_FEATURE_BALLOT_BIT;break;case 65:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_BIT;break;case 66:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;break;case 4427:ok=cfg.enabled_shader_draw_parameters;break;default:xbg_fatalf("Shader stage %u has unhandled capability %u",stage,cap);}if(!ok)xbg_fatalf("Shader stage %u requires disabled capability %u",stage,cap);}
+        if(op==17){uint32_t cap=w[i+1];bool ok=true;switch(cap){case 1:case 46:case 47:case 50:case 51:break;case 2:ok=cfg.enabled_core.geometryShader;break;case 3:ok=cfg.enabled_core.tessellationShader;break;case 10:ok=cfg.enabled_core.shaderFloat64;break;case 11:ok=cfg.enabled_core.shaderInt64;break;case 22:ok=cfg.enabled_core.shaderInt16;break;case 25:ok=cfg.enabled_core.shaderImageGatherExtended;break;case 32:ok=cfg.enabled_core.shaderClipDistance;break;case 33:ok=cfg.enabled_core.shaderCullDistance;break;case 35:ok=cfg.enabled_core.sampleRateShading;break;case 49:ok=cfg.enabled_core.shaderStorageImageExtendedFormats;break;case 55:ok=cfg.enabled_core.shaderStorageImageReadWithoutFormat;break;case 56:ok=cfg.enabled_core.shaderStorageImageWriteWithoutFormat;break;case 61:groups|=VK_SUBGROUP_FEATURE_BASIC_BIT;break;case 62:groups|=VK_SUBGROUP_FEATURE_VOTE_BIT;break;case 63:groups|=VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;break;case 64:groups|=VK_SUBGROUP_FEATURE_BALLOT_BIT;break;case 65:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_BIT;break;case 66:groups|=VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;break;case 4427:ok=cfg.enabled_shader_draw_parameters;break;default:xbg_fatalf("Shader stage %u has unhandled capability %u",stage,cap);}if(!ok)xbg_fatalf("Shader stage %u requires disabled capability %u",stage,cap);}
         if(op==10)xbg_fatalf("Shader stage %u declares extension requiring explicit backend support",stage);i+=count;
     }
-    need((subgroup.supportedOperations&groups)==groups,"Required subgroup operations unavailable");if(group_operations)need(subgroup.supportedStages&(1u<<stage),"Actual subgroup operation unsupported in shader stage");
+    if((subgroup.supportedOperations&groups)!=groups)xbg_fatalf("Shader %s stage %u requires unavailable subgroup operations (experimental=%d)",key,stage,int(experimental));
+    if(group_operations && !(subgroup.supportedStages&(1u<<stage)))xbg_fatalf("Shader %s stage %u uses unsupported subgroup operations in this stage (experimental=%d)",key,stage,int(experimental));
 }
 // Fragment-shader quad-neighbour shuffles rewritten to fine derivatives (xbg_spirv_quad.cpp): on Adreno the shuffles read
 // garbage in helper invocations. The conservative correction skips bit patterns and unproved control/index flows; the
@@ -2027,14 +2028,15 @@ void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
 // control flow (D2R's form: 271 of its 278 calls). Both module
 // loaders apply it, so the warm-up builds the same modules the game binds. Off unless the host asks
 // (DM_GFX_QUAD_DERIVATIVES, which the Android app sets to 1; marker gfx-quad-derivatives = 1 / 0).
-bool quad_derivatives=false;std::atomic<uint64_t> quad_rewrites{0};
-void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,const char *loader){
-    if(!quad_derivatives || stage!=4)return;
+bool quad_derivatives=false,adreno650_fragment_subgroups_experimental=false;std::atomic<uint64_t> quad_rewrites{0};
+void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,const char *loader,bool experimental=false){
+    if((!quad_derivatives && !experimental) || stage!=4)return;
     std::vector<uint32_t> out;xbg_spirv_quad_stats counts;
-    size_t k=xbg_spirv_quad_derivatives(words.data(),words.size(),out,&counts);
+    size_t k=experimental?xbg_spirv_quad_derivatives_experimental(words.data(),words.size(),out,&counts)
+                         :xbg_spirv_quad_derivatives(words.data(),words.size(),out,&counts);
     if(k){words.swap(out);quad_rewrites.fetch_add(k,std::memory_order_relaxed);}
-    if(counts.candidates || counts.calls){
-        char line[768];int at=snprintf(line,sizeof(line),"NVN quad shader=%s loader=%s candidates=%zu rewritten=%zu guarded_nonfinite=%zu calls=%zu calls_rewritten=%zu",key,loader,counts.candidates,counts.rewritten,counts.guarded_nonfinite,counts.calls,counts.calls_rewritten);
+    if(counts.candidates || counts.calls || experimental){
+        char line[768];int at=snprintf(line,sizeof(line),"NVN quad shader=%s loader=%s experimental=%d candidates=%zu rewritten=%zu guarded_nonfinite=%zu calls=%zu calls_rewritten=%zu",key,loader,int(experimental),counts.candidates,counts.rewritten,counts.guarded_nonfinite,counts.calls,counts.calls_rewritten);
         for(size_t r=0;r<size_t(xbg_quad_skip::count) && at<int(sizeof(line))-64;++r)if(counts.skipped[r])at+=snprintf(line+at,sizeof(line)-at," skip_%s=%zu",xbg_spirv_quad_skip_name(xbg_quad_skip(r)),counts.skipped[r]);
         for(size_t r=0;r<size_t(xbg_quad_call_skip::count) && at<int(sizeof(line))-64;++r)if(counts.call_skipped[r])at+=snprintf(line+at,sizeof(line)-at," call_skip_%s=%zu",xbg_spirv_quad_call_skip_name(xbg_quad_call_skip(r)),counts.call_skipped[r]);
         xbg_logf("%s",line);
@@ -2051,7 +2053,7 @@ void warp_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,co
     std::vector<uint32_t> out;size_t k=xbg_spirv_warp32(words.data(),words.size(),subgroup.subgroupSize,out);
     if(k){
         // A vote-only module can acquire Ballot capability during rewriting; check the transformed requirements too.
-        validate_capabilities(out,stage);words.swap(out);warp_rewrites.fetch_add(k,std::memory_order_relaxed);
+        validate_capabilities(out,stage,key);words.swap(out);warp_rewrites.fetch_add(k,std::memory_order_relaxed);
         xbg_logf("NVN warp32 shader=%s loader=%s subgroupSize=%u rewrites=%zu",key,loader,subgroup.subgroupSize,k);
     }
 }
@@ -2105,8 +2107,14 @@ bool helper_has_subgroup(const std::vector<uint32_t> &w){
         else if(op>=333 && op<=366 && in && !entry.count(cur))return true;i+=wc;}
     return false;
 }
-bool inline_rewrite(std::vector<uint32_t> &words,const std::string &key){
-    if(!inline_helpers || !helper_has_subgroup(words))return false;
+bool has_subgroup_operations(const std::vector<uint32_t> &w){
+    for(size_t i=5;i<w.size();){const uint32_t op=w[i]&0xffff,wc=w[i]>>16;if(!wc || i+wc>w.size())return false;
+        if(op>=333 && op<=366)return true;i+=wc;}
+    return false;
+}
+bool inline_rewrite(std::vector<uint32_t> &words,const std::string &key,uint32_t stage){
+    const bool experimental=adreno650_fragment_subgroups_experimental && stage==4 && helper_has_subgroup(words);
+    if((!inline_helpers && !experimental) || !helper_has_subgroup(words))return false;
 #ifdef XBG_HAVE_SPIRV_OPT
     spvtools::Optimizer o(SPV_ENV_VULKAN_1_1);o.RegisterPass(spvtools::CreateMergeReturnPass());o.RegisterPass(spvtools::CreateInlineExhaustivePass());o.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
     std::vector<uint32_t> out;if(o.Run(words.data(),words.size(),&out) && !helper_has_subgroup(out)){words.swap(out);return true;}
@@ -2134,17 +2142,24 @@ Shader *load_shader(const void *control){
     // Time of each part of the load (file read, SPIR-V rewrites, analysis, module creation), for the loaded line below.
     const uint64_t load_t1=timing_clock();uint64_t load_t2=0,load_t3=0;
     auto p=std::make_unique<Shader>();p->key=key;p->stage=h.stage;p->bindings.resize(h.binding_count);memcpy(p->bindings.data(),bytes.data()+offset,h.binding_count*sizeof(xbg_shader_binding));offset+=h.binding_count*sizeof(xbg_shader_binding);p->inputs.resize(h.input_count);memcpy(p->inputs.data(),bytes.data()+offset,h.input_count*4);offset+=h.input_count*4;p->c1.assign(bytes.begin()+offset,bytes.begin()+offset+h.c1_bytes);offset+=h.c1_bytes;
-    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);validate_capabilities(words,h.stage);
+    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);
+    const bool experimental=adreno650_fragment_subgroups_experimental && h.stage==4 && has_subgroup_operations(words);
+    if(!experimental)validate_capabilities(words,h.stage,key.c_str());
     // gfx-shader-reuse：预热线程已改写过这个着色器时直接取用；2 时照样改写，与取来的逐字比对。
     // gfx-shader-reuse: take the warm-up threads' rewrite of this shader when there is one; with 2, rewrite as well and compare word by word.
     std::vector<uint32_t> reused;const bool have_reused=shader_reuse && !ab_off("shreuse") && warm::take_rewritten(key,reused);
     // 预热线程取来的已经内联过（load_module 同一步）；只有自己改写时才内联，免得在图形线程上重做一遍（大着色器 40–90 ms）。
     // What the warm-up hands over is already inlined (the same step in load_module); inline only when rewriting here, so the
     // graphics thread does not redo it (40-90 ms on the large shaders).
-    bool inlined=have_reused && shader_reuse!=2 && inline_helpers && helper_has_subgroup(words);
-    if(!have_reused || shader_reuse==2){inlined=inline_rewrite(words,key);quad_rewrite(words,h.stage,key.c_str(),"runtime");warp_rewrite(words,h.stage,key.c_str(),"runtime");tidy_rewrite(words);
+    bool inlined=have_reused && shader_reuse!=2 && (inline_helpers || experimental) && helper_has_subgroup(words);
+    if(!have_reused || shader_reuse==2){
+        if(experimental)quad_rewrite(words,h.stage,key.c_str(),"runtime",true);
+        inlined=inline_rewrite(words,key,h.stage);
+        if(!experimental)quad_rewrite(words,h.stage,key.c_str(),"runtime");
+        warp_rewrite(words,h.stage,key.c_str(),"runtime");tidy_rewrite(words);
         if(have_reused && reused!=words){++shader_reuse_mismatches;xbg_logf("NVN shader reuse MISMATCH %s stage=%u words=%zu/%zu",key.c_str(),h.stage,reused.size(),words.size());}}
     else words.swap(reused);
+    if(experimental)validate_capabilities(words,h.stage,key.c_str(),true);
     if(have_reused)++shaders_reused;
     load_t2=timing_clock();
     {auto extent=spirv_uniform_extent(words);uint32_t trimmed=0;for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM){auto e=extent.find(b.binding);uint32_t declared=b.bytes?b.bytes:65536;if(e!=extent.end() && e->second<declared){b.bytes=e->second;++trimmed;}}uniform_trimmed+=trimmed;}
@@ -2265,7 +2280,12 @@ VkShaderModule load_module(const std::string &key){
     fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<32 || n>16*1024*1024){fclose(f);return VK_NULL_HANDLE;}std::vector<uint8_t> b(static_cast<size_t>(n));bool ok=fread(b.data(),1,b.size(),f)==b.size();fclose(f);if(!ok)return VK_NULL_HANDLE;
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
-    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(key,w);inline_rewrite(w,key);quad_rewrite(w,h.stage,key.c_str(),"warm");warp_rewrite(w,h.stage,key.c_str(),"warm");tidy_rewrite(w);
+    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(key,w);
+    const bool experimental=adreno650_fragment_subgroups_experimental && h.stage==4 && has_subgroup_operations(w);
+    if(experimental)quad_rewrite(w,h.stage,key.c_str(),"warm",true);
+    inline_rewrite(w,key,h.stage);
+    if(!experimental)quad_rewrite(w,h.stage,key.c_str(),"warm");
+    warp_rewrite(w,h.stage,key.c_str(),"warm");tidy_rewrite(w);
     if(keep_rewritten){std::lock_guard<std::mutex> l(mu);rewritten.emplace(key,w);}
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=w.size()*4;ci.pCode=w.data();VkShaderModule m;if(vkCreateShaderModule(cfg.device,&ci,nullptr,&m)!=VK_SUCCESS)return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> l(mu);auto ins=modules.emplace(key,m);if(!ins.second){vkDestroyShaderModule(cfg.device,m,nullptr);return ins.first->second;}return m;
@@ -4150,6 +4170,14 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};std::vector<uint8_t> cache_data=load_pipeline_cache();cache.initialDataSize=cache_data.size();cache.pInitialData=cache_data.empty()?nullptr:cache_data.data();r=vkCreatePipelineCache(cfg.device,&cache,nullptr,&pipeline_cache);if(r!=VK_SUCCESS){vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;if(error&&bytes)snprintf(error,bytes,"vkCreatePipelineCache=%d",r);return r;}
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string base=cut==std::string::npos?dir:dir.substr(0,cut);
+     FILE *experiment_marker=fopen((base+"/gfx-adreno650-fragment-subgroups").c_str(),"rb");bool experiment_marker_present=experiment_marker!=nullptr;int experiment_marker_value=-1;
+     if(experiment_marker){experiment_marker_value=fgetc(experiment_marker);fclose(experiment_marker);}
+     adreno650_fragment_subgroups_experimental=xbg_adreno650_fragment_subgroups_experimental(properties.vendorID,properties.deviceName,experiment_marker_present,experiment_marker_value);
+#ifndef XBG_HAVE_SPIRV_OPT
+     if(adreno650_fragment_subgroups_experimental){adreno650_fragment_subgroups_experimental=false;xbg_logf("NVN Adreno 650 fragment-subgroup experiment unavailable: SPIRV-Tools is not built into this package");}
+#endif
+     if(experiment_marker_present)xbg_logf("NVN Adreno 650 fragment-subgroup experiment=%d device=\"%s\" marker=gfx-adreno650-fragment-subgroups%s",int(adreno650_fragment_subgroups_experimental),properties.deviceName,adreno650_fragment_subgroups_experimental?" WARNING: experimental shader math":"");
+     if(adreno650_fragment_subgroups_experimental)xbg_logf("NVN Adreno 650 experiment considers every fragment shader with subgroup operations; control-flow and numeric bit-flow guards are relaxed, and visual correctness is not guaranteed");
      const bool rewrites_fault=xbg_adreno_rewrites_fault(properties.vendorID,properties.deviceName);
      if(rewrites_fault)xbg_logf("NVN Adreno 740/750 (device \"%s\"): the quad-derivative and warp32 rewrites default off; a marker file still turns either on",properties.deviceName);
      auto sw=[&](const char *marker,const char *env){FILE *q=fopen((base+marker).c_str(),"rb");const bool present=q!=nullptr;int c=-1;if(q){c=fgetc(q);fclose(q);}return xbg_adreno_rewrite_option(present,c,getenv(env),rewrites_fault);};

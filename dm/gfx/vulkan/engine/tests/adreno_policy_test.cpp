@@ -47,6 +47,13 @@ int main(){
     CHECK(!xbg_adreno_compiler_needs_inline(0x5143,nullptr));
     CHECK(!xbg_adreno_compiler_needs_inline(0x10002,"Adreno 750"));
 
+    // The fragment-subgroup experiment requires both an explicit marker and the exact Qualcomm Adreno 650.
+    CHECK(xbg_adreno650_fragment_subgroups_experimental(0x5143,"Adreno (TM) 650",true,'1'));
+    CHECK(xbg_adreno650_fragment_subgroups_experimental(0x5143,"Adreno 650",true,EOF));
+    CHECK(!xbg_adreno650_fragment_subgroups_experimental(0x5143,"Adreno 650",false,-1));
+    CHECK(!xbg_adreno650_fragment_subgroups_experimental(0x5143,"Adreno 650",true,'0'));
+    CHECK(!xbg_adreno650_fragment_subgroups_experimental(0x5143,"Adreno 660",true,'1'));
+    CHECK(!xbg_adreno650_fragment_subgroups_experimental(0x10002,"Adreno 650",true,'1'));
     // 优先级：标记文件 > 机型判断 > 环境变量。
     // Precedence: marker file > device family > environment.
     CHECK(xbg_adreno_rewrite_option(true,'1',nullptr,false));
