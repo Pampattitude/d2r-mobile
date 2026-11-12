@@ -83,6 +83,55 @@ DM_GEN_DIR=/absolute/path/to/private/generated/headers dm/android/docker/build.s
 The script runs as your user and keeps the debug signing key in `~/.android-dm`; see
 its header for the mounts.
 
+### Windows PowerShell build used for the Mangmi device
+
+This workspace was built natively on Windows with the SDK at
+`C:\Users\guich\AppData\Local\Android\Sdk`, Gradle 9.8.1 under
+`OUTPUT\android-test\tools`, and generated game-derived headers in
+`OUTPUT\android-build\gen`. The generated directory must contain
+`dm_vault_tab.h`, `dm_hud_exp.h`, `dm_bright_levels.inc`, and
+`dm_touch_native_art.c`; generate these from your own game files as described
+above. Keep the Gradle cache on a drive with enough free space.
+
+From the repository root, set paths and build the debug APK:
+
+```powershell
+$repo = (git rev-parse --show-toplevel)
+$out = Join-Path $repo 'OUTPUT'
+$sdk = "$env:LOCALAPPDATA\Android\Sdk"
+$env:ANDROID_HOME = $sdk
+$env:ANDROID_SDK_ROOT = $sdk
+$env:GRADLE_USER_HOME = 'D:\OUTPUT\gradle-home-win'
+$gradle = Join-Path $out 'android-test\tools\gradle-9.8.1\bin\gradle.bat'
+$gen = (Join-Path $out 'android-build\gen').Replace('\', '/')
+$python = (Get-Command python).Source
+Push-Location (Join-Path $repo 'dm\android')
+& $gradle --no-daemon :app:assembleDebug `
+  "-PdmGenDir=$gen" "-PdmPython=$python" `
+  -PdmAppId=com.xiaoboluo.d2r.experimental
+if ($LASTEXITCODE -ne 0) { throw 'Android build failed' }
+Copy-Item 'app\build\outputs\apk\debug\app-debug.apk' `
+  (Join-Path $out 'android-build\unsigned-debug.apk') -Force
+Pop-Location
+```
+
+For this device, sign with the existing local debug key (kept in the WSL Ubuntu
+home, not in the repository) and install as an in-place upgrade:
+
+```powershell
+$signed = Join-Path $out 'D2RMobile-android-debug.apk'
+& "$sdk\build-tools\36.0.0\apksigner.bat" sign `
+  --ks '\\wsl$\Ubuntu\home\pampa\.android\debug.keystore' `
+  --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android `
+  --out $signed (Join-Path $out 'android-build\unsigned-debug.apk')
+if ($LASTEXITCODE -ne 0) { throw 'APK signing failed' }
+& 'E:\Programs\ADB & Fastboot++\adb.exe' -s MQ84112606150649 install -r $signed
+if ($LASTEXITCODE -ne 0) { throw 'APK installation failed' }
+```
+
+Use the same signing key and package ID to preserve the installed app's data;
+never uninstall or clear app data as a build/install step.
+
 ## Private runtime files
 
 The APK and Git repository contain no game program, shaders, game art, or saves.
